@@ -4,7 +4,7 @@ This repository contains the reference implementation of **LaPha**, a method for
 in a **prompt-centered Poincaré latent space**, enabling dense process reward shaping and lightweight value-guided
 test-time scaling.
 
-> Paper: *Latent Poincaré Shaping for Agentic Reinforcement Learning* (ICML 2026 submission / preprint)
+> Paper: *Latent Poincaré Shaping for Agentic Reinforcement Learning* (https://arxiv.org/pdf/2602.09375)
 
 <p align="center">
   <img src="assets/fig1_overview.png" width="900" alt="LaPha overview (Figure 1)"/>
@@ -55,18 +55,6 @@ Core ideas (matching the paper + current codebase):
 
 <p align="center">
   <img src="assets/fig2_pass1_vs_avgacc.png" width="600" alt="Pass@1 vs Average Accuracy"/>
-</p>
-
-### Test-time scaling with value-guided MCTS (Figure 3)
-
-<p align="center">
-  <img src="assets/fig3_test_time_scaling.png" width="700" alt="Test-time scaling curve"/>
-</p>
-
-### Latent-space pruning improves optimization & generalization (Figure 4)
-
-<p align="center">
-  <img src="assets/fig4_pruning_effect.png" width="700" alt="Pruning effect"/>
 </p>
 
 ---
