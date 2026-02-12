@@ -81,24 +81,44 @@ Core ideas (matching the paper + current codebase):
 
 ## Installation
 
-### Option A (recommended): create a Conda env from the exported lockfile
+### Option A
 
-> The provided `requirements.txt` is a **conda explicit environment file** (see its header).
+> The provided `environment.yml` is a **conda explicit environment file** (see its header).
 
 ```bash
-conda create -n lapha --file requirements.txt
-conda activate lapha
-````
+conda env create -f environment.yml
+```
 
 ### Option B: minimal pip install (if you prefer a clean env)
 
 ```bash
-conda create -n lapha python=3.11 -y
+conda create -n lapha python==3.11
 conda activate lapha
 
-pip install -U torch transformers accelerate deepspeed trl vllm \
-  datasets pandas numpy rich matplotlib plotly \
-  fastapi uvicorn gunicorn pdf2image pymupdf
+conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/
+conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r/
+conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/msys2/
+
+pip install "torch==2.7" tensorboard setuptools
+pip install ninja
+pip install flash-attn
+
+pip install --upgrade \
+  "torch" \
+  "tensorboard" \
+  "setuptools" \
+  "ninja" \
+  "flash-attn" \
+  "transformers==4.55.2" \
+  "datasets" \
+  "accelerate" \
+  "hf-transfer" \
+  "deepspeed" \
+  "trl" \
+  "vllm"
+
+conda install python-graphviz
+pip install openpyxl matplotlib seaborn
 ```
 
 > Notes:
