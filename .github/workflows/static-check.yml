@@ -13,7 +13,6 @@ jobs:
       - uses: conda-incubator/setup-miniconda@v3
         with:
           activate-environment: lapha-test
-          environment-file: environment.yml
       - name: Install pylint
         id: install_deps_req
         run: |
