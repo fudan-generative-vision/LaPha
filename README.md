@@ -113,7 +113,7 @@ Example (edit model & TP according to your GPUs):
 
 ```bash
 trl vllm-serve \
-  --model Qwen/Qwen2.5-Math-1.5B \
+  --model cbyzju/LaPHA-Math-7B-Instruct \
   --host 0.0.0.0 \
   --port 8000 \
   --tensor-parallel-size 1 \
@@ -121,19 +121,6 @@ trl vllm-serve \
 ```
 
 ### 2) Run eval
-
-**Single-turn (no search):**
-
-```bash
-ENGINE=vllm BASE_URL=http://localhost:8000 \
-TOKENIZER_PATH=Qwen/Qwen2.5-Math-1.5B \
-MODE=single \
-bash eval.sh math
-```
-
-**Value-guided MCTS (recommended):**
-You need a value head checkpoint (`.pt`) and a base LM path for the value function.
-
 ```bash
 ENGINE=vllm BASE_URL=http://localhost:8000 \
 TOKENIZER_PATH=/path/to/policy_model \
@@ -149,48 +136,3 @@ Outputs:
 
 * rollouts: `eval/rollouts/*.pred.jsonl`
 * scores: `eval/results/*.csv` (and logs under `eval/logs/`)
-
----
-
-## Training (LaPha RL)
-
-The training entry point is `run_dapo.py` (configured by `lapha.yaml`).
-
-### 1) Prepare training data
-
-The current dataloader (`helpers/math_dapo.py::dataloader`) expects a **Parquet** in a DAPO-like format
-(e.g., columns `prompt` and `reward_model` containing ground-truth).
-
-Update the dataset path inside `run_dapo.py`:
-
-```python
-train_dataset = dataloader_dapo('YOUR_DATA_PATH/train.parquet').shuffle()
-```
-
-### 2) Start vLLM + tool server
-
-* Start vLLM server (same as eval)
-* Start `rpc_python_server.py` (same as eval)
-
-### 3) Launch training
-
-```bash
-bash run_dapo.sh
-# or:
-accelerate launch --config_file deepspeed_zero3.yaml run_dapo.py --config lapha.yaml
-```
-
-Checkpoints are saved under `output_dir` in `lapha.yaml`.
-
-### 4) (Optional) Split value head for serving
-
-If your checkpoint directory contains a wrapper model that includes both policy + value head, use:
-
-```bash
-python helpers/split_valuehead.py \
-  --src /path/to/checkpoint-XX \
-  --out-policy /path/to/policy_model_ckptXX \
-  --out-vhead /path/to/value_head_ckptXX.pt \
-  --copy-tokenizer \
-  --trust-remote-code
-```
