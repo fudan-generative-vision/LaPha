@@ -17,6 +17,7 @@ jobs:
           python -m pip install --upgrade pylint
           
           export PYTHONNOUSERSITE=1
+          source /usr/share/miniconda/bin/activate
           conda create -n lapha-test -y -c conda-forge -c defaults \
             python=3.11 pip git ninja cmake cxx-compiler make pkg-config \
             cairo pango poppler graphviz
