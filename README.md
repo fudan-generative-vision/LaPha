@@ -83,7 +83,31 @@ Core ideas (matching the paper + current codebase):
 > The provided `environment.yml` is a **conda explicit environment file** (see its header).
 
 ```bash
-conda env create -f environment.yml
+export PYTHONNOUSERSITE=1
+source /usr/share/miniconda/bin/activate
+conda create -n lapha-test -y -c conda-forge -c defaults \
+  python=3.11 pip git ninja cmake cxx-compiler make pkg-config \
+  cairo pango poppler graphviz
+
+conda activate lapha-test
+python -m pip install -U pip
+
+python -m pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
+  --index-url https://download.pytorch.org/whl/cu128
+
+awk '/^  - pip:/{p=1;next} p && /^prefix:/{p=0} p && /^      - /{sub(/^      - /,""); print}' environment.yml > requirements.txt
+
+grep -Ev \
+'^(torch|torchvision|torchaudio|triton|flash-attn|cupy-cuda12x|deepspeed|xformers|vllm)(==|$)|^nvidia-(cublas|cuda|cudnn|cufft|cufile|curand|cusolver|cusparse|cusparselt|nccl|nvjitlink|nvtx)-cu12==' \
+requirements.txt > requirements.rest.txt
+python -m pip install -r requirements.rest.txt
+
+python -m pip install triton==3.4.0
+python -m pip install cupy-cuda12x==13.6.0
+python -m pip install xformers==0.0.32.post1
+python -m pip install deepspeed==0.18.0
+python -m pip install vllm==0.11.0
+python -m pip install flash-attn==2.8.3 --no-build-isolation --no-deps
 ```
 
 > Notes:
