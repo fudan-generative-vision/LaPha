@@ -8,18 +8,15 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-22.04]
-        python-version: ["3.11"]
     steps:
+      - uses: actions/checkout@v5
       - uses: conda-incubator/setup-miniconda@v3
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v3
         with:
-          python-version: ${{ matrix.python-version }}
+          activate-environment: lapha-test
+          environment-file: environment.yml
       - name: Install pylint
         id: install_deps_req
         run: |
-          conda env create -f environment.yml
-          conda activate lapha-test
           python -m pip install --upgrade pylint
       - name: Analysing the code with pylint
         run: |
