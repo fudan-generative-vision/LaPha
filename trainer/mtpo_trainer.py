@@ -79,6 +79,350 @@ def has_answer(st: dict) -> bool:
     return bool(re.compile(r"<answer>.*?</answer>", re.S).search(st.get("completion", "") or ""))
 
 
+class Qwen2ValueHead(PreTrainedModel):
+    """
+    Qwen2 two-stage value head (h0/h1) aligned with LinearValueHead logic:
+      - h0_raw: pool(base_lm last_hidden) in Euclidean space (float32)
+          h0_centered = h0_raw - root_h0   (if provided; Euclidean translation)
+          y_state     = Exp0(h0_centered / scale)   (Poincaré ball; float32)
+      - h1_raw: pool(value_block(last_hidden)) (float32)
+          v_pred      = activation(W h1_raw)        (float32)
+
+    pool_mask rule (same as your current):
+        pool_mask = ( (response_mask if provided else attention_mask) OR prompt_mask ) AND attention_mask
+
+    - gradient_cut: if True, when value_output=True, detach last_hidden so gradients from
+    (y_state/value_block/value_head) DO NOT flow into base_lm.
+    Also, if hidden_states is None, base_lm forward is run under torch.no_grad() to save memory.
+    - pooling_strategy: "mean" or "last"
+      * "mean": masked mean pooling over pool_mask tokens
+      * "last": take the hidden state of the last token where pool_mask==1 (per row)
+
+    - root_h0: (H,) or (1,H) or (B,H). If provided, apply Euclidean centering BEFORE exp0.
+    - return_h0: if True, also return h0_raw (float32), so caller can cache root_h0.
+    """
+    _no_split_modules = ["Qwen2ValueHead"]
+
+    def __init__(
+        self,
+        base_lm: PreTrainedModel,
+        curvature: float = 1.0,
+        eps: float = 1e-6,
+        eps_ball: float = 1e-4,
+        *,
+        no_head_scale: float = 0.0,          # 0 -> sqrt(H)
+        value_activation: str = "sigmoid",   # "sigmoid" or "none"
+        gradient_cut: bool = False,
+        pooling_strategy: str = "mean",      # "mean" or "last"
+    ):
+        super().__init__(base_lm.config)
+        self.base_lm = base_lm
+
+        self.no_head_scale = float(no_head_scale)
+        self.c = float(curvature)
+        self.eps = float(eps)
+        self.eps_ball = float(eps_ball)
+
+        self.gradient_cut = bool(gradient_cut)
+        self.pooling_strategy = str(pooling_strategy).lower()
+        if self.pooling_strategy not in ("mean", "last"):
+            raise ValueError("pooling_strategy must be 'mean' or 'last'")
+
+        H = int(self.base_lm.config.hidden_size)
+
+        # extra decoder layer as value_block (only used when value_output=True)
+        val_cfg = copy.deepcopy(base_lm.config)
+        if hasattr(val_cfg, "attn_implementation"):
+            try:
+                val_cfg.attn_implementation = "eager"
+            except Exception:
+                pass
+        from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
+        self.value_block = Qwen2DecoderLayer(val_cfg, layer_idx=0)
+
+        self.value_head = nn.Linear(H, 1, bias=True)
+
+        self.value_activation = str(value_activation).lower()
+        if self.value_activation not in ("sigmoid", "none"):
+            raise ValueError("value_activation must be 'sigmoid' or 'none'")
+
+        self.post_init()
+        p = next(self.base_lm.parameters())
+        self.to(device=p.device, dtype=p.dtype)
+
+    # ---------- pooling helpers ----------
+    @staticmethod
+    def _masked_mean(x: torch.Tensor, mask_2d: torch.Tensor) -> torch.Tensor:
+        # x: (B,L,H), mask_2d: (B,L)
+        if mask_2d.dim() != 2:
+            mask_2d = mask_2d.view(mask_2d.size(0), -1)
+        m = mask_2d.to(dtype=x.dtype, device=x.device)
+        denom = m.sum(dim=1, keepdim=True).clamp_min(1.0)
+        return (x * m.unsqueeze(-1)).sum(dim=1) / denom
+
+    @staticmethod
+    def _masked_last(x: torch.Tensor, mask_2d: torch.Tensor) -> torch.Tensor:
+        # x: (B,L,H), mask_2d: (B,L)
+        if mask_2d.dim() != 2:
+            mask_2d = mask_2d.view(mask_2d.size(0), -1)
+        B, L, H = x.shape
+        dev = x.device
+        m = mask_2d.to(device=dev, dtype=torch.long)
+        msum = m.sum(dim=1)  # (B,)
+
+        pos = torch.arange(L, device=dev, dtype=torch.long).view(1, L).expand(B, L)
+        pos = pos.masked_fill(m == 0, -1)
+        last_idx = pos.max(dim=1).values  # (B,) in [-1, L-1]
+
+        out = x.new_zeros((B, H))
+        ok = msum > 0
+        if ok.any():
+            b = torch.arange(B, device=dev, dtype=torch.long)[ok]
+            out[ok] = x[b, last_idx[ok]]
+        return out
+
+    def _pool_hidden(self, x: torch.Tensor, mask_2d: torch.Tensor) -> torch.Tensor:
+        if self.pooling_strategy == "mean":
+            return self._masked_mean(x, mask_2d)
+        return self._masked_last(x, mask_2d)
+
+    @staticmethod
+    def _assert_mask_nonempty_for_valid_rows(mask_2d: torch.Tensor,
+                                            attention_mask: torch.Tensor,
+                                            name: str):
+        mask_sum = mask_2d.sum(dim=1)
+        attn_sum = attention_mask.sum(dim=1)
+        bad = (attn_sum > 0) & (mask_sum == 0)
+        if bad.any():
+            idx = bad.nonzero(as_tuple=False).view(-1)[:8]
+            raise RuntimeError(
+                f"{name} all-zero on non-empty sequences. "
+                f"idx={idx.tolist()}, attn_sum={attn_sum[idx].tolist()}, mask_sum={mask_sum[idx].tolist()}"
+            )
+
+    # ---------- hyperbolic exp0 ----------
+    def _exp0_poincare(self, v: torch.Tensor) -> torch.Tensor:
+        c = float(max(self.c, 1e-8))
+        sqrt_c = math.sqrt(c)
+        vnorm = torch.norm(v, dim=-1, keepdim=True).clamp_min(self.eps)
+        scale = torch.tanh(sqrt_c * vnorm) / (sqrt_c * vnorm)
+        y = scale * v
+        y_norm = torch.norm(y, dim=-1, keepdim=True).clamp_min(self.eps)
+        max_norm = 1.0 - self.eps_ball
+        factor = torch.clamp(max_norm / y_norm, max=1.0)
+        return y * factor
+
+    # ---------- qwen2 layer plumbing ----------
+    @staticmethod
+    def build_position_ids(attn_2d: torch.Tensor, offset: Union[int, torch.Tensor] = 0) -> torch.Tensor:
+        if attn_2d is None:
+            raise ValueError("build_position_ids requires attn_2d")
+        if attn_2d.dim() != 2:
+            attn_2d = attn_2d.view(attn_2d.size(0), -1)
+        attn = attn_2d.to(dtype=torch.long)
+        pos = attn.cumsum(dim=1) - 1
+        pos = pos.clamp_min(0)
+        if isinstance(offset, int):
+            pos = pos + int(offset)
+        else:
+            off = offset.to(device=pos.device, dtype=torch.long).view(-1, 1)
+            pos = pos + off
+        pos = pos * attn
+        return pos
+
+    @staticmethod
+    def _build_causal_4d_mask(attn_2d: Optional[torch.Tensor], L: int, device) -> Optional[torch.Tensor]:
+        if attn_2d is None:
+            return None
+        if attn_2d.dim() != 2:
+            attn_2d = attn_2d.view(attn_2d.size(0), -1)
+        causal = torch.full((L, L), fill_value=-1e9, dtype=torch.float32, device=device)
+        causal = torch.triu(causal, diagonal=1).unsqueeze(0).unsqueeze(0)  # (1,1,L,L)
+        key_pad = (~attn_2d.to(torch.bool)).to(torch.float32).unsqueeze(1).unsqueeze(2) * -1e9  # (B,1,1,L)
+        return causal + key_pad.to(device)
+
+    @staticmethod
+    def _get_rotary_emb(base_lm):
+        m = getattr(base_lm, "model", None)
+        if m is not None and hasattr(m, "rotary_emb"):
+            return m.rotary_emb
+        bm = getattr(base_lm, "base_model", None)
+        if bm is not None and hasattr(bm, "rotary_emb"):
+            return bm.rotary_emb
+        mm = getattr(m, "model", None)
+        if mm is not None and hasattr(mm, "rotary_emb"):
+            return mm.rotary_emb
+        return None
+
+    # ---------- passthrough helpers ----------
+    def generate(self, *args, **kwargs):
+        return self.base_lm.generate(*args, **kwargs)
+
+    def gradient_checkpointing_enable(self, **kwargs):
+        return self.base_lm.gradient_checkpointing_enable(**kwargs)
+
+    def gradient_checkpointing_disable(self, **kwargs):
+        return self.base_lm.gradient_checkpointing_disable(**kwargs)
+
+    # ---------- forward ----------
+    def forward(
+        self,
+        input_ids: Optional[torch.IntTensor] = None,
+        attention_mask: Optional[torch.IntTensor] = None,
+        *,
+        value_output: bool = False,
+        response_mask: Optional[torch.IntTensor] = None,
+        prompt_mask: Optional[torch.IntTensor] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+
+        root_h0: Optional[torch.Tensor] = None,  # (H,) or (1,H) or (B,H)
+        return_h0: bool = False,
+
+        **kwargs,
+    ):
+        if not value_output:
+            return self.base_lm(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+
+        # ---- last_hidden ----
+        if hidden_states is None:
+            if self.gradient_cut:
+                # do NOT build graph for base_lm if we won't backprop into it
+                with torch.no_grad():
+                    out = self.base_lm(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        output_hidden_states=True,
+                        use_cache=False,
+                        return_dict=True,
+                    )
+                    last_hidden = out.hidden_states[-1]
+            else:
+                out = self.base_lm(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                last_hidden = out.hidden_states[-1]
+        else:
+            last_hidden = hidden_states
+
+        # cut gradients into base_lm trunk if requested
+        if self.gradient_cut:
+            last_hidden = last_hidden.detach()
+
+        B, L, H = last_hidden.size()
+        dev = last_hidden.device
+
+        if attention_mask is None:
+            attention_mask = torch.ones((B, L), device=dev, dtype=torch.long)
+        if attention_mask.dim() != 2:
+            attention_mask = attention_mask.view(B, L)
+        attn = attention_mask.to(device=dev, dtype=torch.long)
+
+        # ---- pool_mask = (response_mask or attn) OR prompt_mask, then AND attn ----
+        if response_mask is None:
+            pool = attn
+        else:
+            pool = response_mask
+            if pool.dim() != 2:
+                pool = pool.view(B, L)
+            pool = pool.to(device=dev, dtype=torch.long)
+
+        if prompt_mask is not None:
+            pm = prompt_mask
+            if pm.dim() != 2:
+                pm = pm.view(B, L)
+            pm = pm.to(device=dev, dtype=torch.long)
+            pool = ((pool > 0) | (pm > 0)).long()
+
+        pool = ((pool > 0) & (attn > 0)).long()
+        self._assert_mask_nonempty_for_valid_rows(pool, attn, "pool_mask(context)")
+
+        # =========================================================================
+        # h0_raw -> (root shift) -> exp0 => y_state
+        # =========================================================================
+        h0_raw = self._pool_hidden(last_hidden.to(torch.float32), pool)  # (B,H) float32
+
+        if root_h0 is not None:
+            rh = root_h0
+            if not torch.is_tensor(rh):
+                rh = torch.as_tensor(rh)
+            rh = rh.to(device=dev, dtype=torch.float32)
+
+            if rh.dim() == 1:
+                rh = rh.view(1, -1)
+
+            if rh.size(0) == 1:
+                rh = rh.expand(B, -1)
+            elif rh.size(0) != B:
+                raise RuntimeError(
+                    f"root_h0 batch mismatch: root_h0={tuple(rh.shape)} vs h0_raw={tuple(h0_raw.shape)}"
+                )
+            if rh.size(1) != H:
+                raise RuntimeError(
+                    f"root_h0 hidden mismatch: root_h0={tuple(rh.shape)} vs H={H}"
+                )
+
+            h0_centered = h0_raw - rh
+        else:
+            h0_centered = h0_raw
+
+        scale = self.no_head_scale
+        if scale <= 0.0:
+            scale = float(math.sqrt(H))
+        y_state = self._exp0_poincare(h0_centered / scale)  # (B,H) float32
+
+        # =========================================================================
+        # value_block(last_hidden) -> h1_raw -> v_pred
+        # =========================================================================
+        x = last_hidden  # keep original dtype (bf16/fp16) for block compute
+
+        if position_ids is None:
+            position_ids = self.build_position_ids(attn, offset=0)
+
+        attn_bias = self._build_causal_4d_mask(attn, L, dev)
+
+        rotary_emb = self._get_rotary_emb(self.base_lm)
+        position_embeddings = None
+        if rotary_emb is not None:
+            try:
+                position_embeddings = rotary_emb(x, position_ids)
+            except TypeError:
+                position_embeddings = rotary_emb(position_ids)
+
+        fw_sig = inspect.signature(self.value_block.forward)
+        kw = {
+            "hidden_states": x,
+            "attention_mask": attn_bias,
+            "output_attentions": False,
+            "use_cache": False,
+        }
+        if "position_ids" in fw_sig.parameters:
+            kw["position_ids"] = position_ids
+        if "position_embeddings" in fw_sig.parameters:
+            kw["position_embeddings"] = position_embeddings
+
+        out_blk = self.value_block(**kw)
+        x1 = out_blk[0] if isinstance(out_blk, (tuple, list)) else out_blk
+
+        h1_raw = self._pool_hidden(x1.to(torch.float32), pool)  # (B,H) float32
+
+        h1_for_v = h1_raw.to(dtype=self.value_head.weight.dtype)  # match head dtype
+        v_logit = self.value_head(h1_for_v).squeeze(-1)          # (B,)
+
+        if self.value_activation == "sigmoid":
+            v_pred = torch.sigmoid(v_logit).to(torch.float32)
+        else:
+            v_pred = v_logit.to(torch.float32)
+
+        if return_h0:
+            return y_state, v_pred, h0_raw  # h0_raw float32 (cache as root_h0)
+        return y_state, v_pred
+
+
 class LinearValueHead(PreTrainedModel):
     """
     Linear value head with root-centered euclidean translation BEFORE exp0.
@@ -656,8 +1000,10 @@ class MTPOTrainer(Trainer):
                 curvature=float(getattr(args, "curvature", 1.0)),
                 eps=float(getattr(args, "hyp_eps", 1e-6)),
                 eps_ball=float(getattr(args, "hyp_eps_ball", 1e-4)),
-                no_head_scale=float(getattr(args, "no_head_scale", 0.0)),  # 0 -> sqrt(H)
+                no_head_scale=float(getattr(args, "no_head_scale", 0.0)),
                 value_activation=str(getattr(args, "value_activation", "sigmoid")),
+                gradient_cut=bool(getattr(args, "gradient_cut", True)),
+                pooling_strategy=str(getattr(args, "pooling_strategy", "mean")),
             )
         else:
             raise ValueError(f"Unknown value_head_type={vh_type!r}. Use 'qwen2' or 'linear'.")
@@ -1074,8 +1420,8 @@ class MTPOTrainer(Trainer):
     ):
         """
         Value function for MCTS:
-        - y_state: Poincaré point of current state
-        - v_pred : scalar value.
+        - y_state: Poincaré point of current state (used for bank/clustering/potential shaping/L_mono)
+        - v_pred : scalar value, obtained by regression from the independent value_head (default sigmoid -> (0,1))
         Returns (y_state_cpu[B,H], v_cpu[B])
         """
         assert self.accelerator.is_main_process, "value_fn must be called on main process only."
@@ -1488,6 +1834,7 @@ class MTPOTrainer(Trainer):
         # =========================================================================
         # 1) Rank0: MCTS rollout + reward computation + chain sampling
         # =========================================================================
+        self.num_groups = 8
         if self.accelerator.is_main_process:
             t_rollout_all = time.perf_counter()
             
@@ -1496,18 +1843,14 @@ class MTPOTrainer(Trainer):
             roots_meta: list[dict] = []
             step_samples: list[dict] = []
             tree_ground_truth: list[object] = []
-
-            self.num_groups = getattr(self, "num_groups", 8)
             # Value_loss training set control:
-            #   num_trees = -1 -> Train only on step_samples (preserves original behavior)
-            #   num_trees != -1 -> Train on all nodes of the first num_trees "non-zero trees"
+            #    num_trees = -1 -> Train only on step_samples (preserves original behavior)
+            #    num_trees != -1 -> Train on all nodes of the first num_trees "non-zero trees" (MSE truncates base gradient)
             num_trees_cfg = int(getattr(self.args, "num_trees", -1))
             mse_nodes: list[dict] = []
             mse_tree_cnt = 0
 
             eps_reward = 1e-12
-            eps_vt = 1e-8
-
             global_group_count = 0
             early_stop = False
 
@@ -1608,15 +1951,18 @@ class MTPOTrainer(Trainer):
                     passAt_1_list.append(passAt_1)
                     tree_ground_truth.append(ground_truth)
 
-                    # First, determine if the tree is an "all-zero signal tree" (if all 0s, neither the policy nor the MSE will be trained).
-                    has_sig = any(abs(float(st.get("v_target", 0.0))) > eps_vt for ch in expansions for st in ch)
+                    # Determine if the tree is an non-signal-tree
+                    has_sig = any(
+                        (st["v_target"] is not None)
+                        for ch in expansions for st in ch
+                    ) and avgAcc > 0.0
                     if not has_sig:
                         _p(f"MCTS[{idx}]: no v_target signal (all-zero tree), skip tree.")
                         roots_meta.append({"tree_id": tree_id, "prompt_ids": []})
                         continue
 
-                    # num_chains deprecated: all chains are included; chain_id uses chain_idx from expansions
-                    # To handle "shared/duplicate nodes": prompt_key -> the chain_idx of its first occurrence
+                    # `num_chains` is deprecated: all chains are included; chain_id uses the chain_idx from expansions
+                    # To handle the case of "shared nodes/duplicate nodes": prompt_key -> the first occurrence of its chain_idx
                     prompt_key_to_chain_id: dict[tuple, int] = {}
                     for chain_idx, chain in enumerate(expansions):
                         for st in chain:
@@ -1662,8 +2008,6 @@ class MTPOTrainer(Trainer):
                                 continue
 
                             key = tuple(p_list[-self.max_prompt_length:])
-                            cid = int(prompt_key_to_chain_id.get(key, chain_idx))
-
                             sample = dict(
                                 prompt_ids     = p_list[-self.max_prompt_length:],
                                 chain_id       = int(prompt_key_to_chain_id[key]),
@@ -1675,7 +2019,7 @@ class MTPOTrainer(Trainer):
                                 depth          =         int(st["current_depth"]),
                                 is_correct     =           bool(st["is_correct"]),
                                 on_path        =              bool(st["on_path"]),
-                                v_target       =            float(st["v_target"]),
+                                v_target       =                   st["v_target"],
                                 v_pred         =              float(st["v_pred"]),
                                 has_answer     =             bool(has_answer(st)),
                             )
@@ -1697,9 +2041,8 @@ class MTPOTrainer(Trainer):
                             )
                         mse_tree_cnt += 1
 
-                    # skip: Trees with a height of avgAcc will not be included in step_samples.
-                    if avgAcc >= 0.8:
-                        _p(f"MCTS[{idx}]: avgAcc >= 0.8, skip tree for training stability.")
+                    if avgAcc > 0.9:
+                        _p(f"MCTS[{idx}]: avg Acc. > 0.9, skip tree for training stability.")
                         roots_meta.append({"tree_id": tree_id, "prompt_ids": []})
                         continue
 
@@ -1727,7 +2070,7 @@ class MTPOTrainer(Trainer):
                             early_stop = True
                             break
                         
-                        if tree_group_count >= 2:
+                        if tree_group_count >= 4:
                             break
 
                         if self.breadth > 0 and len(samples) < self.breadth:
@@ -1737,11 +2080,6 @@ class MTPOTrainer(Trainer):
                         r_vals = [float(s["reward"]) for s in samples]
                         if (max(r_vals) - min(r_vals)) <= eps_reward:
                             _p("        reward range too small")
-                            continue
-
-                        vt_vals = [float(s["v_target"]) for s in samples]
-                        if max(vt_vals) <= eps_vt:
-                            _p("        v_target max too small")
                             continue
 
                         ss = sorted(samples, key=lambda s: float(s["reward"]), reverse=True)
@@ -1867,7 +2205,7 @@ class MTPOTrainer(Trainer):
         broadcast_object_list(proj_wrapper, from_process=0)
         self.accelerator.wait_for_everyone()
 
-        if not step_samples:
+        if len(step_samples) // self.breadth < self.num_groups:
             self._metrics["loss"].append(0.0)
             return torch.tensor(0.0, device=device, requires_grad=True)
 
@@ -1915,8 +2253,8 @@ class MTPOTrainer(Trainer):
 
         def _completion_eos_mask_1d(ids_1d: torch.Tensor, eos_id_int: int) -> torch.Tensor:
             """
-            ids_1d: (Lc,) completion ids (no pad)
-            Returns: (Lc,) long mask, with 1 before EOS (inclusive) and 0 after EOS; if there is no EOS, all values ​​are 1.
+            ids_1d: (Lc,) completion ids (without pad)
+            Returns: (Lc,) long mask, 1 before EOS (inclusive), 0 after EOS; if there is no EOS, all 1s
             """
             m = torch.ones_like(ids_1d, dtype=torch.long)
             if eos_id_int is None:
@@ -2030,7 +2368,7 @@ class MTPOTrainer(Trainer):
             per_token_logps = torch.stack(per_token_list, dim=0)  # (B,T)
 
             # Correct the placeholder dimension of y_state: use the first non-placeholder y to determine H
-            # (If all samples are empty, it degenerates to (B,1))
+            # (If all samples are empty, degenerate to (B,1))
             y_valid = [y for y in y_list if y.dim() == 1 and y.numel() > 1]
             if y_valid:
                 H = int(y_valid[0].numel())
@@ -2090,7 +2428,7 @@ class MTPOTrainer(Trainer):
         mask_f = completion_mask.to(torch.float32)
 
         # =========================================================================
-        # 4) Optional reference KL penalty
+        # 4) KL penalty
         # =========================================================================
         beta = float(getattr(self, "beta", 0.0))
         if beta > 0.0:
@@ -2166,136 +2504,18 @@ class MTPOTrainer(Trainer):
             per_token_kl = None
 
         # =========================================================================
-        # 5) Value loss = MSE(v_pred)        (rank loss removed)
+        # 5) Value loss = MSE(v_pred)
         # =========================================================================
-        use_all_nodes_mse = (int(num_trees_cfg) != -1) and (mse_samples is not None) and (len(mse_samples) > 0)
         value_w = float(getattr(self.args, "value_w", 1.0))
-        
-        if use_all_nodes_mse:
-            mse_micro_bs = int(getattr(self.args, "mse_micro_bs", micro_bs))
-            mse_micro_bs = max(1, mse_micro_bs)
-
-            # unwrap base lm (for hidden extraction)
-            base_mod = model
-            if hasattr(base_mod, "module"):  # deepspeed / ddp
-                base_mod = base_mod.module
-            base = getattr(base_mod, "base_lm", base_mod)
-            base_tfm = getattr(base, "model", None)
-
-            # group by prompt_ids (keep your existing grouping behavior)
-            groups = defaultdict(list)
-            for it in mse_samples:
-                pids = it.get("prompt_ids", None)
-                if not pids:
-                    continue
-                try:
-                    key = tuple(int(x) for x in pids)
-                except Exception:
-                    continue
-                groups[key].append(it)
-
-            mse_sum = torch.zeros((), device=device, dtype=torch.float32)
-            mse_cnt = 0
-
-            for _, items in groups.items():
-                # build valid seqs for this group
-                seqs: list[torch.Tensor] = []
-                rm_list: list[torch.Tensor] = []
-                pm_list: list[torch.Tensor] = []
-                tgt_list: list[float] = []
-
-                for it in items:
-                    try:
-                        p = torch.as_tensor(it["prompt_ids"], device=device, dtype=torch.long).view(-1)
-                        c = torch.as_tensor(it["completion_ids"], device=device, dtype=torch.long).view(-1)
-                    except Exception:
-                        continue
-
-                    # Defense: Eliminate any pads that may have been mixed in
-                    p = p[p != pad_token]
-                    c = c[c != pad_token]
-                    if p.numel() == 0 or c.numel() == 0:
-                        continue
-
-                    full = torch.cat([p, c], dim=0)  # (L,)
-                    c_mask = _completion_eos_mask_1d(c, eos_id).to(device=device, dtype=torch.long)  # (Lc,)
-                    resp = torch.cat([torch.zeros_like(p), c_mask], dim=0)  # (L,)
-                    pm   = torch.cat([torch.ones_like(p), torch.zeros_like(c)], dim=0)  # (L,)
-
-                    seqs.append(full)
-                    rm_list.append(resp)
-                    pm_list.append(pm)
-                    tgt_list.append(float(it.get("v_target", 0.0)))
-
-                if not seqs:
-                    continue
-
-                tgts = torch.as_tensor(tgt_list, device=device, dtype=torch.float32).clamp(0.0, 1.0)
-
-                # forward in micro-batches
-                for s in range(0, len(seqs), mse_micro_bs):
-                    chunk_seqs = seqs[s : s + mse_micro_bs]
-                    chunk_rm   = rm_list[s : s + mse_micro_bs]
-                    chunk_pm   = pm_list[s : s + mse_micro_bs]
-                    tgt_chunk  = tgts[s : s + mse_micro_bs]
-
-                    Lmax = max(int(x.numel()) for x in chunk_seqs)
-                    Bm = len(chunk_seqs)
-
-                    ids_full = torch.full((Bm, Lmax), pad_token, device=device, dtype=torch.long)
-                    rm_full  = torch.zeros((Bm, Lmax), device=device, dtype=torch.long)
-                    pm_full  = torch.zeros((Bm, Lmax), device=device, dtype=torch.long)
-
-                    for i in range(Bm):
-                        li = int(chunk_seqs[i].numel())
-                        ids_full[i, :li] = chunk_seqs[i]
-                        rm_full[i, :li]  = chunk_rm[i]
-                        pm_full[i, :li]  = chunk_pm[i]
-
-                    am_full = (ids_full != pad_token).long()
-
-                    # Base forward (To truncate the gradient, use last_hidden.detach())
-                    if base_tfm is not None:
-                        out0 = base_tfm(
-                            input_ids=ids_full,
-                            attention_mask=am_full,
-                            use_cache=False,
-                            return_dict=True,
-                        )
-                        last_hidden = out0.last_hidden_state
-                    else:
-                        out0 = base(
-                            input_ids=ids_full,
-                            attention_mask=am_full,
-                            output_hidden_states=True,
-                            use_cache=False,
-                            return_dict=True,
-                        )
-                        last_hidden = out0.hidden_states[-1]
-
-                    # value head forward
-                    _y, v_pred_chunk = model(
-                        input_ids=ids_full,
-                        attention_mask=am_full,
-                        hidden_states=last_hidden,  # last_hidden.detach()
-                        response_mask=rm_full,
-                        prompt_mask=pm_full,
-                        value_output=True,
-                    )
-                    v_pred_chunk = v_pred_chunk.to(torch.float32)
-
-                    mse_sum = mse_sum + F.mse_loss(v_pred_chunk, tgt_chunk, reduction="sum")
-                    mse_cnt += int(v_pred_chunk.numel())
-
-            value_mse = (mse_sum / float(max(mse_cnt, 1))).to(torch.float32)
-        else:
-            v_target = torch.as_tensor(
-                [float(st.get("v_target", 0.0)) for st in step_samples],
-                device=device,
-                dtype=torch.float32,
-            ).clamp(0.0, 1.0)
-
-            value_mse = F.mse_loss(v_pred_new, v_target)
+        vt_list = [st.get("v_target", None) for st in step_samples]
+        valid_idx = [i for i, vt in enumerate(vt_list) if vt is not None]
+        idx_t = torch.as_tensor(valid_idx, device=device, dtype=torch.long)
+        v_target = torch.as_tensor(
+            [float(vt_list[i]) for i in valid_idx],
+            device=device,
+            dtype=torch.float32,
+        )
+        value_mse = F.mse_loss(v_pred_new.index_select(0, idx_t), v_target)
 
         # value_loss:
         value_loss = value_mse
@@ -2304,7 +2524,7 @@ class MTPOTrainer(Trainer):
         if hasattr(self, "writer"):
             step_id = self.state.global_step
             self.writer.add_scalar("Loss/ValueLoss", float(value_loss.item()), step_id)
-
+            
         # =========================================================================
         # 6) Policy loss
         # =========================================================================
@@ -2332,7 +2552,7 @@ class MTPOTrainer(Trainer):
         K = int(group_ids.max().item()) + 1 if group_ids.numel() > 0 else 0
 
         # Advantage computation
-        scale_rewards = getattr(self.args, "scale_rewards", "group")
+        scale_rewards = getattr(self.args, "scale_rewards", "none")
         if isinstance(scale_rewards, bool):
             scale_rewards = "group" if scale_rewards else "none"
         scale_rewards = str(scale_rewards).lower()
@@ -2346,7 +2566,6 @@ class MTPOTrainer(Trainer):
             g_mean = g_sum / (g_cnt + 1e-8)
 
             centered = rewards_t - g_mean[group_ids]
-
             if scale_rewards in ("none", "false", "0"):
                 advantages = centered
             elif scale_rewards in ("batch", "global"):
@@ -2414,7 +2633,7 @@ class MTPOTrainer(Trainer):
         # =========================================================================
         # 7) Final Loss
         # =========================================================================
-        loss = policy_loss + value_w * value_loss  # + struc_w * struc_loss
+        loss = policy_loss + value_w * value_loss  # struc_w * struc_loss
         self._metrics["loss"].append(float(loss.item()))
 
         prompt_len = (prompt_ids != pad_token).int().sum(dim=1)            # (B,)
@@ -2659,46 +2878,57 @@ class MTPOTrainer(Trainer):
         # =========================================================================
         # 2) Bottom-up win_rate / value propagation
         # =========================================================================
+        # leaf_cnt[sid] = number of TERMINAL leaves under sid (0 => no terminal leaves)
+        leaf_cnt: dict[int, int] = {}
+
         @lru_cache(None)
         def dfs_wr(sid: int) -> Optional[float]:
             """
-            Recursively compute "win_rate" (scalar reward signal) for each node:
-
-            - For leaf nodes:
-                * If terminal, win_rate is the aggregated reward from reward_fns.
-                * If non-terminal, win_rate is None (ignored in internal aggregation).
-            - For internal nodes:
-                * Aggregate all non-None children's win_rate via `agg_internal`.
+            win_rate(s) := mean over TERMINAL leaves under s.
+            If no terminal leaves under s -> None.
             """
             st = id2[sid]
             children = ch[sid]
+
+            # graph leaf
             if not children:
-                # Leaf: distinguish between terminal vs non-terminal
-                is_leaf = _is_terminal_leaf(st, children)
-                st["is_leaf"] = bool(is_leaf)
-                if is_leaf:
+                is_term = _is_terminal_leaf(st, children)
+                st["is_leaf"] = bool(is_term)
+                if is_term:
                     comp = st.get("completion", "")
-                    r = agg_leaf([f(comp, ground_truth) for f in reward_fns])
-                    st["win_rate"] = float(r)
-                    return st["win_rate"]
-                else:
-                    st["win_rate"] = None
-                    return None
-            # Internal node: aggregate all defined child win_rates
-            vals = []
-            for c in children:
-                vc = dfs_wr(c)
-                if vc is not None:
-                    vals.append(float(vc))
-            if vals:
-                wr = float(agg_internal(vals))
-                st["win_rate"] = wr
-                st["is_leaf"] = False
-                return wr
-            else:
+                    r = float(agg_leaf([f(comp, ground_truth) for f in reward_fns]))
+                    st["win_rate"] = r
+                    leaf_cnt[sid] = 1
+                    st["win_cnt"] = 1  # optional debug
+                    return r
+
                 st["win_rate"] = None
-                st["is_leaf"] = False
+                leaf_cnt[sid] = 0
+                st["win_cnt"] = 0  # optional debug
                 return None
+
+            # internal: weighted mean by terminal-leaf counts
+            sum_r = 0.0
+            cnt = 0
+            for c in children:
+                vc = dfs_wr(c)                 # child's mean over its terminal leaves, or None
+                cc = int(leaf_cnt.get(c, 0))   # child's terminal-leaf count
+                if (vc is not None) and (cc > 0):
+                    sum_r += float(vc) * cc
+                    cnt += cc
+
+            st["is_leaf"] = False
+            st["win_cnt"] = cnt  # optional debug
+
+            if cnt > 0:
+                wr = sum_r / float(cnt)
+                st["win_rate"] = float(wr)
+                leaf_cnt[sid] = cnt
+                return st["win_rate"]
+
+            st["win_rate"] = None
+            leaf_cnt[sid] = 0
+            return None
 
         for r in roots:
             dfs_wr(r)
@@ -2749,12 +2979,15 @@ class MTPOTrainer(Trainer):
             id2[sid]["on_path"] = (sid in success_path_nodes)
             
         # ===========================================================================
-        # 5) Build V_map(s) for shaping / v_target
-        #   - remove CoT anchor entirely
-        #   - potential from:
-        #       d_goal(s) = min_{g in correct_leaves} d(y(s), y(g))
-        #       d_root(s) = d(y(s), y_root)
-        #       V(s)      = d_root / (d_root + d_goal + eps)
+        # 5) Build V_map(s) for shaping (potential) and set v_target = win_rate
+        #
+        #   Potential-based shaping:
+        #     Φ(s)   = - d_goal(s)
+        #     d_goal = min_{g in anchors} d(y(s), y(g))
+        #     => ΔΦ(edge) = Φ(child) - Φ(parent) = -Δd_goal
+        #
+        #   Critic target:
+        #     v_target := win_rate (backup/MC), decoupled from geometry.
         # ===========================================================================
         V_map: dict[int, float] = {}
         rho_by_sid: dict[int, float] = {}
@@ -2780,27 +3013,24 @@ class MTPOTrainer(Trainer):
                 c_hyp = float(getattr(self.model, "c", 1.0))
                 c_hyp = max(c_hyp, 1e-8)
 
-                # radius diagnostics for pass@1 selection
+                # radius diagnostics (optional)
                 rho_all = torch.linalg.norm(Y, dim=-1)  # (N,)
                 for sid, row in sid2row.items():
                     rho_by_sid[sid] = float(rho_all[row].item())
 
                 # ---- anchor set for d_goal: (real correct leaves) + (cot anchor if provided) ----
                 anchors = []
-                # (1) real correct leaves from search
                 cr_rows = [sid2row[s] for s in correct_leaf_sids if s in sid2row]
                 if len(cr_rows) > 0:
                     corr_rows_t = torch.as_tensor(cr_rows, device=Y.device, dtype=torch.long)
                     anchors.append(Y.index_select(0, corr_rows_t))  # (C, Dp)
-                # (2) always include cot as an extra "successful correct leaf" anchor (if provided)
+
                 y_cot = None
                 if cot is not None:
-                    # choose a prompt_ids to pair with cot
                     p_ids = None
                     if root_step is not None:
                         p_ids = root_step.get("prompt_ids", None)
                     if p_ids is None and roots:
-                        # fallback: pick any root node's prompt_ids
                         p_ids = id2[roots[0]].get("prompt_ids", None)
 
                     c_ids = _cot_to_completion_ids(cot)
@@ -2810,34 +3040,31 @@ class MTPOTrainer(Trainer):
                             y_cot = y_cot.to(device=Y.device, dtype=Y.dtype)  # (1, Dp)
                             anchors.append(y_cot)
 
-                # If still no anchors, it's a dead tree
                 if not anchors:
                     V_map = {sid: 0.0 for sid in id2.keys()}
                 else:
-                    y_root = Y[sid2row[root_sid]]
-                    y_corr = torch.cat(anchors, dim=0)  # (C + 1, Dp) if cot exists
-                    # ---- distances ----
+                    y_corr = torch.cat(anchors, dim=0)  # (C, Dp)
+
+                    # d_goal(s) = min distance to any anchor
                     d_goal = poincare_dist_matrix_stable(Y, y_corr, c=c_hyp).min(dim=1).values.float()  # (N,)
-                    d_root = poincare_dist_stable(Y, y_root.view(1, -1).expand_as(Y), c=c_hyp).float()  # (N,)
 
-                    eps = 1e-8
-                    V_nodes = (d_root / (d_root + d_goal + eps)).clamp(0.0, 1.0)
+                    # Φ(s) = -d_goal(s)  (higher => closer to goal)
+                    Phi = -d_goal  # (N,)
 
-                    V_map = {}
-                    for sid, row in sid2row.items():
-                        V_map[sid] = float(V_nodes[row].item())
+                    V_map = {sid: float(Phi[row].item()) for sid, row in sid2row.items()}
+                    # fill missing keys defensively
                     for sid in id2.keys():
-                        V_map[sid]
+                        V_map.setdefault(sid, 0.0)
 
                     # optional logging
-                    self._metrics.setdefault("vmap_mean", []).append(float(V_nodes.mean().item()))
-                    self._metrics.setdefault("vmap_std",  []).append(float(V_nodes.std(unbiased=False).item()))
+                    self._metrics.setdefault("vmap_mean", []).append(float(Phi.mean().item()))
+                    self._metrics.setdefault("vmap_std",  []).append(float(Phi.std(unbiased=False).item()))
                     if hasattr(self, "writer"):
                         step_id = self.state.global_step
-                        self.writer.add_scalar("VMap/mean", float(V_nodes.mean().item()), step_id)
-                        self.writer.add_scalar("VMap/std",  float(V_nodes.std(unbiased=False).item()), step_id)
+                        self.writer.add_scalar("VMap/mean", float(Phi.mean().item()), step_id)
+                        self.writer.add_scalar("VMap/std",  float(Phi.std(unbiased=False).item()), step_id)
 
-            # ---- group-wise masking (keep as before, since no cot anchor now) ----
+            # ---- group-wise masking (kept as before) ----
             group2sids: dict[tuple[int, ...], list[int]] = defaultdict(list)
             group_has_onpath: dict[tuple[int, ...], bool] = defaultdict(bool)
 
@@ -2860,7 +3087,7 @@ class MTPOTrainer(Trainer):
                 group2sids[key].append(sid)
                 if bool(st.get("on_path", False)):
                     group_has_onpath[key] = True
-            
+
             # Disable not "on_path" nodes only
             # for sid in id2.keys():
             #     if not bool(id2[sid].get("on_path", False)):
@@ -2871,9 +3098,9 @@ class MTPOTrainer(Trainer):
             #         for sid in sids_in_group:
             #             V_map[sid] = 0.0
 
-        # Write back v_target for every node
+        # v_target := win_rate (geometry-free critic target)
         for sid, st in id2.items():
-            st["v_target"] = float(V_map[sid])
+            st["v_target"] = st.get("win_rate", None)
 
         # =========================================================================
         # 6) pass@1
@@ -2886,11 +3113,13 @@ class MTPOTrainer(Trainer):
             passAt_1 = 1.0 if bool(id2[best_sid].get("is_correct", False)) else 0.0
 
         # =========================================================================
-        # 7) Step-level rewards: ΔV + structural bonus / adaptive mixing
+        # 7) Step-level rewards: ΔΦ + structural bonus / adaptive mixing
+        #    Here Φ(s)=V_map[s]= -d_goal(s), so ΔΦ = -Δd_goal (can be +/-).
+        #    Removed max()/clip()/clamp() that squash the signal.
         # =========================================================================
-        adaptive = bool(getattr(self.args, "adaptive_fmt_bonus", True))
+        adaptive = bool(getattr(self.args, "adaptive_fmt_bonus", False))
         if not adaptive:
-            # Strict formatting
+            # Strict formatting (still gates by format if you keep fb)
             for sid, st in id2.items():
                 if sid == root_sid:
                     st["reward"] = 0.0
@@ -2899,20 +3128,20 @@ class MTPOTrainer(Trainer):
                 if p is None:
                     st["reward"] = 0.0
                     continue
-                dv = V_map[sid] - V_map[p]  # float(max(0.0, V_map[sid] - V_map[p]))
+                dv = float(V_map[sid] - V_map[p])  # == -Δd_goal
                 fb = 1.0 if (_fmt_bonus(st.get("completion", "")) > 0.0) else 0.0
-                st["reward"] = dv
+                st["reward"] = dv * fb
         else:
             # Tree-level statistics for adaptive mixing
             fmt_flags = []   # formatting is good (1.0) vs bad (0.0) per edge
-            dv_list   = []   # ΔV per edge (child-parent)
+            dv_list   = []   # ΔΦ per edge (child-parent), can be negative
             for sid, st in id2.items():
                 if sid == root_sid:
                     continue
                 p = parent_of.get(sid, None)
                 if p is None:
                     continue
-                dv = V_map[sid] - V_map[p]
+                dv = float(V_map[sid] - V_map[p])
                 dv_list.append(dv)
                 fmt_flags.append(1.0 if (_fmt_bonus(st.get("completion", "")) > 0.0) else 0.0)
 
@@ -2927,8 +3156,10 @@ class MTPOTrainer(Trainer):
             dv_arr = np.asarray(dv_list, dtype=np.float32)
             dv_var_eps  = float(getattr(self.args, "adapt_dv_var_eps", 1e-12))
             dv_sum_eps  = float(getattr(self.args, "adapt_dv_sum_eps", 1e-9))
-            has_dv_sig  = bool((dv_arr.size > 0) and (float(dv_arr.var()) > dv_var_eps)
-                                and (float(dv_arr.sum()) > dv_sum_eps))
+            # with signed dv, use absolute mass instead of sum()>0
+            has_dv_sig  = bool((dv_arr.size > 0)
+                                and (float(dv_arr.var()) > dv_var_eps)
+                                and (float(np.abs(dv_arr).sum()) > dv_sum_eps))
 
             alpha_fmt = float(getattr(self.args, "adapt_alpha_fmt", 1.0))
             alpha_dv  = float(getattr(self.args, "adapt_alpha_dv",  1.0))
@@ -2936,14 +3167,10 @@ class MTPOTrainer(Trainer):
             raw_dv    = (def_cont ** alpha_dv) if has_dv_sig else 0.0
 
             eps_w   = float(getattr(self.args, "adapt_eps", 1e-8))
-            min_w   = float(getattr(self.args, "adapt_min_weight", 0.0))
             denom   = raw_fmt + raw_dv + eps_w
             w_fmt   = raw_fmt / denom
             w_dv    = raw_dv  / denom
-            if (raw_fmt > 0.0) and (raw_dv > 0.0) and (min_w > 0.0):
-                w_fmt = float(np.clip(w_fmt, min_w, 1.0 - min_w))
-                w_dv  = 1.0 - w_fmt
-                
+
             for sid, st in id2.items():
                 if sid == root_sid:
                     st["reward"] = 0.0
@@ -2952,12 +3179,12 @@ class MTPOTrainer(Trainer):
                 if p is None:
                     st["reward"] = 0.0
                     continue
-                # ΔV
-                dv = float(max(0.0, V_map[sid] -V_map[p]))
+
+                dv = float(V_map[sid] - V_map[p])  # signed shaping
                 fb = 1.0 if (_fmt_bonus(st.get("completion", "")) > 0.0) else 0.0
 
-                r = w_dv * dv + w_fmt * fb
-                st["reward"] = float(np.clip(r, 0.0, 1.0))
+                # no np.clip here
+                st["reward"] = float(w_dv * dv + w_fmt * fb)
         
         # =========================================================================
         # 8) Visualization (unchanged from original)
@@ -3152,7 +3379,7 @@ class MTPOTrainer(Trainer):
             if str(ground_truth) not in model_output:
                 return 0.0
             elif str(ground_truth) == model_output:
-                return 0.8
+                return 1.0
         else:
             return 0.0
 
